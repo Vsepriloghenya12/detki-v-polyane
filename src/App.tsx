@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 
 type ParentTab = 'schedule' | 'profile'
 type OwnerTab = 'lessons' | 'families' | 'attendance'
@@ -89,6 +89,8 @@ export default function App() {
   const [installEvent, setInstallEvent] = useState<BeforeInstallPromptEvent | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
+  const syncVersion = useRef(0)
+  const mutating = useRef(false)
   const normalizedPath = window.location.pathname.replace(/\/+$/, '') || '/'
   const isOwnerPath = normalizedPath === '/owner'
 
@@ -98,9 +100,10 @@ export default function App() {
   }
 
   const syncState = async (silent = false) => {
+    const version = syncVersion.current
     try {
       const state = await api<AppState>('/api/state')
-      applyState(state)
+      if (!mutating.current && version === syncVersion.current) applyState(state)
       if (!silent) setError('')
     } catch (requestError) {
       if (!silent) setError(requestError instanceof Error ? requestError.message : errorMessages.server_error)
@@ -110,11 +113,16 @@ export default function App() {
   }
 
   const run = async (action: () => Promise<void>) => {
+    mutating.current = true
+    syncVersion.current += 1
     try {
       setError('')
       await action()
     } catch (requestError) {
       setError(requestError instanceof Error ? requestError.message : errorMessages.server_error)
+    } finally {
+      syncVersion.current += 1
+      mutating.current = false
     }
   }
 
