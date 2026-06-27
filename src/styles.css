@@ -433,6 +433,36 @@ button.plain {
   background: #f0eee9;
 }
 
+.subscription-notice {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  padding: 13px 14px;
+  color: #775a20;
+  background: #fbf2dc;
+  border: 1px solid #efdfb7;
+  border-radius: 17px;
+}
+
+.subscription-notice .app-icon {
+  width: 31px;
+  height: 31px;
+}
+
+.subscription-notice div {
+  display: grid;
+  gap: 2px;
+}
+
+.subscription-notice strong {
+  font-size: 13px;
+}
+
+.subscription-notice span {
+  font-size: 11px;
+  line-height: 1.35;
+}
+
 .lesson-card {
   position: relative;
   isolation: isolate;

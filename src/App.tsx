@@ -636,7 +636,7 @@ function Welcome({ onRegister, installEvent, installApp, error }: { onRegister: 
         <div className="brand-lockup">
           <img className="brand-mark" src="/assets/logo-mountain-mark.svg" alt="" />
           <h1>Детки в поляне</h1>
-          <p>Записывайтесь на занятия,<br />смотрите абонемент и получайте<br />комментарии воспитателя</p>
+          <p>Следите за расписанием, записывайтесь на занятия и отслеживайте свои абонементы</p>
         </div>
       </section>
       {error ? <p className="error">{error}</p> : null}
@@ -731,6 +731,12 @@ function ParentSchedule({ sessions, currentFamily, remaining, onToggleBooking }:
         <div><span className="eyebrow">Ближайшие даты</span><h2>Расписание занятий</h2></div>
         <StatusBadge tone={remaining > 2 ? 'success' : remaining > 0 ? 'warning' : 'danger'}>{remaining} осталось</StatusBadge>
       </div>
+      {remaining < 1 ? (
+        <div className="subscription-notice">
+          <AppIcon name="subscription" />
+          <div><strong>Абонемент пока не активен</strong><span>После оформления воспитателем можно записываться на занятия.</span></div>
+        </div>
+      ) : null}
       {visibleSessions.length === 0 ? <p>Занятий пока нет.</p> : visibleSessions.map(session => {
         const booked = session.bookedChildIds.includes(currentFamily.id)
         const bookedCount = session.bookedCount ?? session.bookedChildIds.length
@@ -742,7 +748,7 @@ function ParentSchedule({ sessions, currentFamily, remaining, onToggleBooking }:
           booked={booked}
           disabled={disabled}
           actionClass={booked ? 'cancel-booking' : ''}
-          actionLabel={booked ? 'Отменить запись' : remaining < 1 ? 'Нет занятий в абонементе' : full ? 'Нет мест' : 'Записаться'}
+          actionLabel={booked ? 'Отменить запись' : full ? 'Мест нет' : 'Записаться'}
           onAction={() => onToggleBooking(session)}
         />
       })}
@@ -977,10 +983,11 @@ function OwnerFamilies({ families, subscriptions, transactions, onAddSubscriptio
               onAddSubscription(family.id, new FormData(event.currentTarget))
               event.currentTarget.reset()
             }}>
-              <label>Добавить занятий<input name="totalLessons" type="number" min="1" defaultValue="8" required /></label>
+              <div className="form-title"><AppIcon name="subscription" /><h3>Новый абонемент</h3></div>
+              <label>Количество занятий<input name="totalLessons" type="number" min="1" defaultValue="8" required /></label>
               <label>Действует до<input name="expiresAt" type="date" /></label>
               <label>Примечание<input name="note" placeholder="Оплата за июль" /></label>
-              <button type="submit">Добавить абонемент</button>
+              <button type="submit">Выдать абонемент</button>
             </form>
             {childTransactions.length > 0 ? (
               <div className="transaction-list">
@@ -1019,7 +1026,9 @@ function OwnerAttendance({ sessions, families, subscriptions, onSetAttendance, o
   const availableSessions = sessions
     .filter(session => session.status !== 'cancelled')
     .sort(sortSessions)
-  const [selectedDate, setSelectedDate] = useState(todayIso())
+  const nearestBookedSession = availableSessions.find(session => session.date >= todayIso() && session.bookedChildIds.length > 0)
+  const nearestSession = availableSessions.find(session => session.date >= todayIso())
+  const [selectedDate, setSelectedDate] = useState(() => nearestBookedSession?.date || nearestSession?.date || todayIso())
   const dateSessions = availableSessions.filter(session => session.date === selectedDate)
   const preferred = dateSessions[0]
   const [selectedId, setSelectedId] = useState(() => preferred?.id || '')
@@ -1030,6 +1039,12 @@ function OwnerAttendance({ sessions, families, subscriptions, onSetAttendance, o
       setSelectedId(preferred.id)
     }
   }, [sessions, selectedDate, selectedId])
+
+  useEffect(() => {
+    if (nearestBookedSession && !availableSessions.some(session => session.date === selectedDate && session.bookedChildIds.length > 0)) {
+      setSelectedDate(nearestBookedSession.date)
+    }
+  }, [sessions])
 
   return (
     <section className="screen-section attendance-screen">
