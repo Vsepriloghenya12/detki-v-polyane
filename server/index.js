@@ -17,12 +17,8 @@ let pool = null
 let dbReady = false
 
 const uid = () => crypto.randomUUID()
-
-const addDays = days => {
-  const date = new Date()
-  date.setDate(date.getDate() + days)
-  return date.toISOString().slice(0, 10)
-}
+const weekdayCodes = ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun']
+const jsDayToWeekday = ['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat']
 
 const cleanPhone = value => String(value || '').replace(/[\s()-]/g, '')
 
@@ -32,7 +28,7 @@ const initialState = () => ({
     {
       id: uid(),
       title: 'Творческая поляна',
-      date: addDays(1),
+      weekdays: ['tue', 'thu'],
       time: '10:00',
       duration: '60 минут',
       description: 'Рисование, лепка и свободная игра',
@@ -44,7 +40,7 @@ const initialState = () => ({
     {
       id: uid(),
       title: 'Музыкальное занятие',
-      date: addDays(3),
+      weekdays: ['sat'],
       time: '11:00',
       duration: '45 минут',
       description: 'Ритм, песни, движение и мягкая адаптация',
@@ -56,12 +52,24 @@ const initialState = () => ({
   ]
 })
 
+const normalizeWeekdays = lesson => {
+  const weekdays = Array.isArray(lesson?.weekdays)
+    ? [...new Set(lesson.weekdays.map(String).filter(day => weekdayCodes.includes(day)))]
+    : []
+  if (weekdays.length) return weekdays.sort((a, b) => weekdayCodes.indexOf(a) - weekdayCodes.indexOf(b))
+
+  const legacyDate = String(lesson?.date || '')
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(legacyDate)) return []
+  const day = new Date(`${legacyDate}T12:00:00`).getDay()
+  return [jsDayToWeekday[day]]
+}
+
 const normalizeState = value => ({
   families: Array.isArray(value?.families) ? value.families : [],
   lessons: Array.isArray(value?.lessons) ? value.lessons.map(lesson => ({
     id: String(lesson.id || uid()),
     title: String(lesson.title || ''),
-    date: String(lesson.date || ''),
+    weekdays: normalizeWeekdays(lesson),
     time: String(lesson.time || ''),
     duration: String(lesson.duration || ''),
     description: String(lesson.description || ''),
@@ -71,6 +79,11 @@ const normalizeState = value => ({
     comments: lesson.comments && typeof lesson.comments === 'object' ? lesson.comments : {}
   })) : []
 })
+
+const lessonSortKey = lesson => {
+  const firstDay = Math.min(...normalizeWeekdays(lesson).map(day => weekdayCodes.indexOf(day)))
+  return `${String(Number.isFinite(firstDay) ? firstDay : 99).padStart(2, '0')}-${lesson.time}`
+}
 
 const initDb = async () => {
   if (!usePostgres || dbReady) return
@@ -203,15 +216,15 @@ const handleApi = async (req, res, pathname) => {
   if (req.method === 'POST' && pathname === '/api/lessons') {
     const body = await readBody(req)
     const title = String(body.title || '').trim()
-    const date = String(body.date || '')
+    const weekdays = normalizeWeekdays(body)
     const time = String(body.time || '')
     const duration = String(body.duration || '').trim()
     const description = String(body.description || '').trim()
     const capacity = Math.max(1, Number(body.capacity) || 1)
-    if (!title || !date || !time || !duration) return badRequest(res)
+    if (!title || weekdays.length === 0 || !time || !duration) return badRequest(res)
     const state = await readState()
-    state.lessons.push({ id: uid(), title, date, time, duration, description, capacity, bookedIds: [], attendedIds: [], comments: {} })
-    state.lessons.sort((a, b) => `${a.date}T${a.time}`.localeCompare(`${b.date}T${b.time}`))
+    state.lessons.push({ id: uid(), title, weekdays, time, duration, description, capacity, bookedIds: [], attendedIds: [], comments: {} })
+    state.lessons.sort((a, b) => lessonSortKey(a).localeCompare(lessonSortKey(b)))
     await saveState(state)
     return json(res, 200, state)
   }

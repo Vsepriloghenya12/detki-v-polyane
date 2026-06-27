@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 
 type ParentTab = 'schedule' | 'profile'
 type OwnerTab = 'lessons' | 'families' | 'attendance'
+type Weekday = 'mon' | 'tue' | 'wed' | 'thu' | 'fri' | 'sat' | 'sun'
 
 type Family = {
   id: string
@@ -16,7 +17,7 @@ type Family = {
 type Lesson = {
   id: string
   title: string
-  date: string
+  weekdays: Weekday[]
   time: string
   duration: string
   description: string
@@ -33,7 +34,7 @@ type AppState = {
 
 type NewLesson = {
   title: string
-  date: string
+  weekdays: Weekday[]
   time: string
   duration: string
   description: string
@@ -47,13 +48,23 @@ type BeforeInstallPromptEvent = Event & {
 
 const storeKey = 'detki-v-polyane'
 
-const todayIso = () => new Date().toISOString().slice(0, 10)
+const weekdayOptions: { value: Weekday; short: string; label: string }[] = [
+  { value: 'mon', short: 'Пн', label: 'понедельник' },
+  { value: 'tue', short: 'Вт', label: 'вторник' },
+  { value: 'wed', short: 'Ср', label: 'среда' },
+  { value: 'thu', short: 'Чт', label: 'четверг' },
+  { value: 'fri', short: 'Пт', label: 'пятница' },
+  { value: 'sat', short: 'Сб', label: 'суббота' },
+  { value: 'sun', short: 'Вс', label: 'воскресенье' }
+]
+const weekdayOrder = weekdayOptions.map(day => day.value)
 
 const cleanPhone = (value: string) => value.replace(/[\s()-]/g, '')
 
-const formatDate = (value: string) => {
-  const date = new Date(`${value}T12:00:00`)
-  return date.toLocaleDateString('ru-RU', { weekday: 'long', day: 'numeric', month: 'long' })
+const formatWeekdays = (values: Weekday[]) => {
+  const labels = weekdayOptions.filter(day => values.includes(day.value)).map(day => day.label)
+  const text = labels.join(', ')
+  return text ? text.charAt(0).toUpperCase() + text.slice(1) : 'Дни не выбраны'
 }
 
 const errorMessages: Record<string, string> = {
@@ -164,13 +175,13 @@ export default function App() {
   const addLesson = async (form: FormData) => {
     const lesson: NewLesson = {
       title: String(form.get('title') || '').trim(),
-      date: String(form.get('date') || ''),
+      weekdays: form.getAll('weekdays').map(String).filter(day => weekdayOrder.includes(day as Weekday)) as Weekday[],
       time: String(form.get('time') || ''),
       duration: String(form.get('duration') || '').trim(),
       description: String(form.get('description') || '').trim(),
       capacity: String(form.get('capacity') || '0')
     }
-    if (!lesson.title || !lesson.date || !lesson.time || !lesson.duration) return
+    if (!lesson.title || lesson.weekdays.length === 0 || !lesson.time || !lesson.duration) return
     const state = await api<AppState>('/api/lessons', {
       method: 'POST',
       body: JSON.stringify({ ...lesson, capacity: Math.max(1, Number(lesson.capacity) || 1) })
@@ -230,8 +241,10 @@ export default function App() {
     return (
       <main>
         <section className="hello">
-          <h1>Детки в поляне</h1>
-          <p>Загрузка данных</p>
+          <div className="brand-lockup">
+            <h1>Детки в поляне</h1>
+            <p>Загрузка данных</p>
+          </div>
         </section>
       </main>
     )
@@ -301,8 +314,10 @@ function Welcome({ onRegister, installEvent, installApp, error }: { onRegister: 
   return (
     <main>
       <section className="hello">
-        <h1>Детки в поляне</h1>
-        <p>Расписание занятий, запись, посещаемость, комментарии воспитателя и абонементы.</p>
+        <div className="brand-lockup">
+          <h1>Детки в поляне</h1>
+          <p>Расписание занятий, запись, посещаемость, комментарии воспитателя и абонементы.</p>
+        </div>
       </section>
 
       {error ? <p className="error">{error}</p> : null}
@@ -347,7 +362,7 @@ function ParentSchedule({ lessons, currentFamily, remaining, onToggleBooking }: 
         const disabled = !booked && (full || remaining < 1)
         return (
           <article key={lesson.id}>
-            <time>{formatDate(lesson.date)} · {lesson.time}</time>
+            <time>{formatWeekdays(lesson.weekdays)} · {lesson.time}</time>
             <h3>{lesson.title}</h3>
             <p>{lesson.duration}</p>
             {lesson.description ? <p>{lesson.description}</p> : null}
@@ -388,7 +403,7 @@ function ParentProfile({ family, lessons, attended, remaining }: { family: Famil
       <h2>Комментарии после занятий</h2>
       {comments.length === 0 ? <p>Комментариев пока нет.</p> : comments.map(lesson => (
         <article key={lesson.id}>
-          <time>{formatDate(lesson.date)} · {lesson.time}</time>
+          <time>{formatWeekdays(lesson.weekdays)} · {lesson.time}</time>
           <h3>{lesson.title}</h3>
           <p>{lesson.comments[family.id]}</p>
         </article>
@@ -406,10 +421,17 @@ function OwnerLessons({ lessons, onAdd, onRemove }: { lessons: Lesson[]; onAdd: 
           Название занятия
           <input name="title" placeholder="Сенсорная поляна" required />
         </label>
-        <label>
-          Дата
-          <input name="date" type="date" min={todayIso()} required />
-        </label>
+        <fieldset>
+          <legend>Дни недели</legend>
+          <div className="weekday-options">
+            {weekdayOptions.map(day => (
+              <label className="weekday-option" key={day.value}>
+                <input type="checkbox" name="weekdays" value={day.value} aria-label={day.label} />
+                {day.short}
+              </label>
+            ))}
+          </div>
+        </fieldset>
         <label>
           Время
           <input name="time" type="time" required />
@@ -431,7 +453,7 @@ function OwnerLessons({ lessons, onAdd, onRemove }: { lessons: Lesson[]; onAdd: 
 
       {lessons.slice().sort(sortLessons).map(lesson => (
         <article key={lesson.id}>
-          <time>{formatDate(lesson.date)} · {lesson.time}</time>
+          <time>{formatWeekdays(lesson.weekdays)} · {lesson.time}</time>
           <h3>{lesson.title}</h3>
           <p>{lesson.duration}</p>
           {lesson.description ? <p>{lesson.description}</p> : null}
@@ -488,7 +510,7 @@ function OwnerAttendance({ lessons, families, onToggleAttendance, onComment }: {
       <label>
         Занятие
         <select value={selectedLesson.id} onChange={event => setSelectedId(event.target.value)}>
-          {lessons.slice().sort(sortLessons).map(lesson => <option key={lesson.id} value={lesson.id}>{formatDate(lesson.date)} · {lesson.time} · {lesson.title}</option>)}
+          {lessons.slice().sort(sortLessons).map(lesson => <option key={lesson.id} value={lesson.id}>{formatWeekdays(lesson.weekdays)} · {lesson.time} · {lesson.title}</option>)}
         </select>
       </label>
 
@@ -515,9 +537,10 @@ function OwnerAttendance({ lessons, families, onToggleAttendance, onComment }: {
 }
 
 function sortLessons(a: Lesson, b: Lesson) {
-  return `${a.date}T${a.time}`.localeCompare(`${b.date}T${b.time}`)
+  const firstDay = (lesson: Lesson) => Math.min(...lesson.weekdays.map(day => weekdayOrder.indexOf(day)))
+  return `${String(firstDay(a)).padStart(2, '0')}-${a.time}`.localeCompare(`${String(firstDay(b)).padStart(2, '0')}-${b.time}`)
 }
 
 function sortLessonsDesc(a: Lesson, b: Lesson) {
-  return `${b.date}T${b.time}`.localeCompare(`${a.date}T${a.time}`)
+  return sortLessons(b, a)
 }

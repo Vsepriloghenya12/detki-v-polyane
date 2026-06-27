@@ -12,6 +12,7 @@
     "preview": "npm run build && npm run start"
   },
   "dependencies": {
+    "@fontsource/marck-script": "^5.2.8",
     "@vitejs/plugin-react": "^4.3.4",
     "pg": "^8.13.1",
     "react": "^18.3.1",
