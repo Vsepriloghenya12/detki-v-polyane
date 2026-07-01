@@ -8,6 +8,7 @@
     "dev:server": "node server/index.js",
     "dev:web": "vite --host 0.0.0.0",
     "build": "tsc -b && vite build",
+    "test": "node --test server/index.test.js src/calendar.test.js",
     "start": "node server/index.js",
     "preview": "npm run build && npm run start"
   },

@@ -29,7 +29,12 @@ const subscriptionStatuses = ['active', 'expired', 'finished']
 const sessionPastDays = 30
 const sessionFutureDays = 30
 
-const cleanPhone = value => String(value || '').replace(/[\s()-]/g, '')
+const cleanPhone = value => {
+  const digits = String(value || '').replace(/\D/g, '')
+  if (digits.length === 11 && digits.startsWith('8')) return `7${digits.slice(1)}`
+  if (digits.length === 10) return `7${digits}`
+  return digits
+}
 
 const moscowToday = () => {
   const parts = new Intl.DateTimeFormat('en', {
@@ -53,8 +58,9 @@ const sessionIdFor = (templateId, date) => `session-${templateId}-${date}`
 const sessionSortKey = session => `${session.date}T${session.timeSnapshot}`
 
 const initialState = () => ({
-  schemaVersion: 2,
+  schemaVersion: 3,
   families: [],
+  parents: [],
   lessonTemplates: [
     {
       id: uid(),
@@ -99,12 +105,22 @@ const normalizeWeekdays = value => {
 
 const normalizeFamily = family => ({
   id: String(family.id || uid()),
+  householdId: String(family.householdId || `household-${family.id || uid()}`),
   phone: cleanPhone(family.phone),
   firstName: String(family.firstName || ''),
   lastName: String(family.lastName || ''),
   childName: String(family.childName || ''),
   paidLessons: Math.max(0, Number(family.paidLessons) || 0),
   createdAt: String(family.createdAt || nowIso())
+})
+
+const normalizeParent = parent => ({
+  id: String(parent.id || uid()),
+  householdId: String(parent.householdId || ''),
+  phone: cleanPhone(parent.phone),
+  firstName: String(parent.firstName || ''),
+  lastName: String(parent.lastName || ''),
+  createdAt: String(parent.createdAt || nowIso())
 })
 
 const normalizeTemplate = template => {
@@ -283,6 +299,19 @@ const getUpcomingSessions = (state, from = moscowToday(), to = shiftDate(moscowT
 
 const migrateState = value => {
   const families = Array.isArray(value?.families) ? value.families.map(normalizeFamily) : []
+  const parents = Array.isArray(value?.parents) ? value.parents.map(normalizeParent) : []
+  for (const family of families) {
+    if (!parents.some(parent => parent.householdId === family.householdId)) {
+      parents.push(normalizeParent({
+        id: `legacy-parent-${family.id}`,
+        householdId: family.householdId,
+        phone: family.phone,
+        firstName: family.firstName,
+        lastName: family.lastName,
+        createdAt: family.createdAt
+      }))
+    }
+  }
   const legacyLessons = Array.isArray(value?.lessons) ? value.lessons : []
   const templateSource = Array.isArray(value?.lessonTemplates)
     ? value.lessonTemplates
@@ -303,8 +332,9 @@ const migrateState = value => {
   const lessonSessions = sessionSource.map(session => normalizeSession(session, lessonTemplates))
 
   const state = {
-    schemaVersion: 2,
+    schemaVersion: 3,
     families,
+    parents,
     lessonTemplates,
     lessonSessions,
     subscriptions: Array.isArray(value?.subscriptions) ? value.subscriptions.map(normalizeSubscription) : [],
@@ -415,6 +445,100 @@ const getSubscriptionSummary = (state, childId) => {
     remainingLessons: subscriptions.reduce((sum, item) => sum + item.remainingLessons, 0),
     expiresAt: subscriptions.find(item => item.status === 'active' && item.expiresAt)?.expiresAt || null
   }
+}
+
+const addSubscription = (state, childId, totalLessons, expiresAt = null, note = '') => {
+  const lessons = Math.max(0, Number(totalLessons) || 0)
+  if (lessons < 1) return null
+  const timestamp = nowIso()
+  const subscription = normalizeSubscription({
+    id: uid(),
+    childId,
+    totalLessons: lessons,
+    usedLessons: 0,
+    status: 'active',
+    startsAt: moscowToday(),
+    expiresAt: expiresAt || null,
+    createdAt: timestamp,
+    updatedAt: timestamp,
+    note: String(note || '')
+  })
+  state.subscriptions.push(subscription)
+  state.subscriptionTransactions.push(normalizeTransaction({
+    id: uid(),
+    subscriptionId: subscription.id,
+    childId,
+    type: 'add',
+    amount: lessons,
+    reason: subscription.note || 'Добавление абонемента',
+    createdAt: timestamp,
+    createdBy: 'owner'
+  }))
+  return subscription
+}
+
+const adjustSubscriptionBalance = (state, childId, direction, amount, note = '') => {
+  const lessons = Number(amount)
+  if (!['add', 'remove'].includes(direction) || !Number.isInteger(lessons) || lessons < 1) {
+    return { error: 'bad_request' }
+  }
+
+  refreshSubscriptionStatuses(state)
+  const subscriptions = state.subscriptions
+    .filter(subscription => subscription.childId === childId)
+    .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+  const timestamp = nowIso()
+  let changedSubscription
+
+  if (direction === 'add') {
+    changedSubscription = subscriptions.find(subscription => subscription.status === 'active')
+    if (changedSubscription) {
+      changedSubscription.totalLessons += lessons
+      changedSubscription.remainingLessons = Math.max(0, changedSubscription.totalLessons - changedSubscription.usedLessons)
+      changedSubscription.updatedAt = timestamp
+    } else {
+      changedSubscription = normalizeSubscription({
+        id: uid(),
+        childId,
+        totalLessons: lessons,
+        usedLessons: 0,
+        status: 'active',
+        startsAt: moscowToday(),
+        expiresAt: null,
+        createdAt: timestamp,
+        updatedAt: timestamp,
+        note: String(note || '')
+      })
+      state.subscriptions.push(changedSubscription)
+    }
+  } else {
+    const totalRemaining = subscriptions.reduce((sum, subscription) => sum + subscription.remainingLessons, 0)
+    if (lessons > totalRemaining) return { error: 'adjustment_exceeds_balance' }
+
+    let lessonsToRemove = lessons
+    for (const subscription of subscriptions) {
+      if (lessonsToRemove < 1 || subscription.remainingLessons < 1) continue
+      const removed = Math.min(lessonsToRemove, subscription.remainingLessons)
+      subscription.totalLessons -= removed
+      subscription.remainingLessons = Math.max(0, subscription.totalLessons - subscription.usedLessons)
+      subscription.updatedAt = timestamp
+      changedSubscription ||= subscription
+      lessonsToRemove -= removed
+    }
+  }
+
+  refreshSubscriptionStatuses(state)
+  state.subscriptionTransactions.push(normalizeTransaction({
+    id: uid(),
+    subscriptionId: changedSubscription.id,
+    childId,
+    type: 'manual_adjustment',
+    amount: lessons,
+    reason: `${direction === 'add' ? 'Добавлено' : 'Убрано'} вручную${note ? `: ${String(note).trim()}` : ''}`,
+    createdAt: timestamp,
+    createdBy: 'owner'
+  }))
+  return { subscription: changedSubscription }
 }
 
 const chargeSubscription = (state, childId, lessonSessionId) => {
@@ -561,7 +685,7 @@ const readState = async () => {
       const state = migrateState(raw)
       createSessionsFromTemplates(state)
       refreshSubscriptionStatuses(state)
-      if (raw.schemaVersion !== 2) await saveState(state)
+      if (raw.schemaVersion !== 3) await saveState(state)
       return state
     }
     const state = initialState()
@@ -576,7 +700,7 @@ const readState = async () => {
     const state = migrateState(raw)
     createSessionsFromTemplates(state)
     refreshSubscriptionStatuses(state)
-    if (raw.schemaVersion !== 2) await saveState(state)
+    if (raw.schemaVersion !== 3) await saveState(state)
     return state
   } catch {
     const state = initialState()
@@ -632,24 +756,32 @@ const safePasswordEqual = (left, right) => {
   return crypto.timingSafeEqual(leftHash, rightHash)
 }
 
-const publicSession = (session, familyId) => ({
-  ...session,
-  bookedCount: session.bookedChildIds.length,
-  bookedChildIds: familyId && session.bookedChildIds.includes(familyId) ? [familyId] : [],
-  attendance: familyId && session.attendance[familyId] ? { [familyId]: session.attendance[familyId] } : {},
-  comments: familyId && session.comments[familyId] ? { [familyId]: session.comments[familyId] } : {}
-})
+const publicSession = (session, familyIds) => {
+  const allowedIds = new Set(Array.isArray(familyIds) ? familyIds : familyIds ? [familyIds] : [])
+  return {
+    ...session,
+    bookedCount: session.bookedChildIds.length,
+    bookedChildIds: session.bookedChildIds.filter(childId => allowedIds.has(childId)),
+    attendance: Object.fromEntries(Object.entries(session.attendance).filter(([childId]) => allowedIds.has(childId))),
+    comments: Object.fromEntries(Object.entries(session.comments).filter(([childId]) => allowedIds.has(childId)))
+  }
+}
 
 const parentState = (state, familyId = '') => {
   const family = state.families.find(item => item.id === familyId)
+  const families = family
+    ? state.families.filter(item => item.householdId === family.householdId)
+    : []
+  const familyIds = families.map(item => item.id)
   return {
-    schemaVersion: 2,
-    families: family ? [family] : [],
+    schemaVersion: 3,
+    families,
+    parents: family ? state.parents.filter(parent => parent.householdId === family.householdId) : [],
     lessonTemplates: [],
-    lessonSessions: state.lessonSessions.map(session => publicSession(session, familyId)),
-    subscriptions: family ? getChildSubscriptions(state, family.id) : [],
-    subscriptionTransactions: family
-      ? state.subscriptionTransactions.filter(transaction => transaction.childId === family.id)
+    lessonSessions: state.lessonSessions.map(session => publicSession(session, familyIds)),
+    subscriptions: familyIds.flatMap(childId => getChildSubscriptions(state, childId)),
+    subscriptionTransactions: familyIds.length
+      ? state.subscriptionTransactions.filter(transaction => familyIds.includes(transaction.childId))
       : []
   }
 }
@@ -711,19 +843,97 @@ const handleApi = async (req, res, url) => {
     const firstName = String(body.firstName || '').trim()
     const lastName = String(body.lastName || '').trim()
     const childName = String(body.childName || '').trim()
-    if (!phone || !firstName || !lastName || !childName) return badRequest(res)
+    if (!phone) return badRequest(res)
     const state = await readState()
-    const existing = state.families.find(family => cleanPhone(family.phone) === phone)
+    const existingParent = state.parents.find(parent => cleanPhone(parent.phone) === phone)
     let family
-    if (existing) {
-      family = { ...existing, phone, firstName, lastName, childName }
-      state.families = state.families.map(item => item.id === existing.id ? family : item)
+    if (existingParent) {
+      family = state.families.find(item => item.householdId === existingParent.householdId)
+      if (!family) return notFound(res)
     } else {
-      family = normalizeFamily({ id: uid(), phone, firstName, lastName, childName, paidLessons: 0, createdAt: nowIso() })
+      if (!firstName || !lastName || !childName) return badRequest(res)
+      const householdId = uid()
+      const createdAt = nowIso()
+      family = normalizeFamily({ id: uid(), householdId, phone, firstName, lastName, childName, paidLessons: 0, createdAt })
       state.families.push(family)
+      state.parents.push(normalizeParent({ id: uid(), householdId, phone, firstName, lastName, createdAt }))
     }
     await saveState(state)
     return json(res, 200, { state: parentState(state, family.id), family })
+  }
+
+  if (req.method === 'POST' && pathname === '/api/owner/households') {
+    if (!requireOwnerAuth(req, res)) return
+    const body = await readBody(req)
+    const parent = body.parent || {}
+    const child = body.child || {}
+    const phone = cleanPhone(parent.phone)
+    const firstName = String(parent.firstName || '').trim()
+    const lastName = String(parent.lastName || '').trim()
+    const childName = String(child.childName || '').trim()
+    if (!phone || !firstName || !lastName || !childName) return badRequest(res)
+    const state = await readState()
+    if (state.parents.some(item => cleanPhone(item.phone) === phone)) return badRequest(res, 'phone_already_used')
+    const householdId = uid()
+    const createdAt = nowIso()
+    const family = normalizeFamily({
+      id: uid(),
+      householdId,
+      phone,
+      firstName,
+      lastName,
+      childName,
+      paidLessons: 0,
+      createdAt
+    })
+    state.parents.push(normalizeParent({ id: uid(), householdId, phone, firstName, lastName, createdAt }))
+    state.families.push(family)
+    addSubscription(state, family.id, child.totalLessons, child.expiresAt, child.note)
+    await saveState(state)
+    return json(res, 200, state)
+  }
+
+  const householdParentMatch = pathname.match(/^\/api\/owner\/households\/([^/]+)\/parents$/)
+  if (req.method === 'POST' && householdParentMatch) {
+    if (!requireOwnerAuth(req, res)) return
+    const body = await readBody(req)
+    const householdId = decodeURIComponent(householdParentMatch[1])
+    const phone = cleanPhone(body.phone)
+    const firstName = String(body.firstName || '').trim()
+    const lastName = String(body.lastName || '').trim()
+    if (!phone || !firstName || !lastName) return badRequest(res)
+    const state = await readState()
+    if (!state.families.some(family => family.householdId === householdId)) return notFound(res)
+    if (state.parents.some(parent => cleanPhone(parent.phone) === phone)) return badRequest(res, 'phone_already_used')
+    state.parents.push(normalizeParent({ id: uid(), householdId, phone, firstName, lastName, createdAt: nowIso() }))
+    await saveState(state)
+    return json(res, 200, state)
+  }
+
+  const householdChildMatch = pathname.match(/^\/api\/owner\/households\/([^/]+)\/children$/)
+  if (req.method === 'POST' && householdChildMatch) {
+    if (!requireOwnerAuth(req, res)) return
+    const body = await readBody(req)
+    const householdId = decodeURIComponent(householdChildMatch[1])
+    const childName = String(body.childName || '').trim()
+    if (!childName) return badRequest(res)
+    const state = await readState()
+    const primaryParent = state.parents.find(parent => parent.householdId === householdId)
+    if (!primaryParent) return notFound(res)
+    const family = normalizeFamily({
+      id: uid(),
+      householdId,
+      phone: primaryParent.phone,
+      firstName: primaryParent.firstName,
+      lastName: primaryParent.lastName,
+      childName,
+      paidLessons: 0,
+      createdAt: nowIso()
+    })
+    state.families.push(family)
+    addSubscription(state, family.id, body.totalLessons, body.expiresAt, body.note)
+    await saveState(state)
+    return json(res, 200, state)
   }
 
   if (req.method === 'POST' && pathname === '/api/lesson-templates') {
@@ -834,6 +1044,22 @@ const handleApi = async (req, res, url) => {
     return json(res, 200, parentState(state, childId))
   }
 
+  const ownerSessionChildMatch = pathname.match(/^\/api\/owner\/lesson-sessions\/([^/]+)\/children$/)
+  if (req.method === 'POST' && ownerSessionChildMatch) {
+    if (!requireOwnerAuth(req, res)) return
+    const body = await readBody(req)
+    const childId = String(body.childId || '')
+    const state = await readState()
+    const session = state.lessonSessions.find(item => item.id === decodeURIComponent(ownerSessionChildMatch[1]))
+    if (!session || !state.families.some(family => family.id === childId)) return notFound(res)
+    if (!session.bookedChildIds.includes(childId)) {
+      session.bookedChildIds.push(childId)
+      session.updatedAt = nowIso()
+      await saveState(state)
+    }
+    return json(res, 200, state)
+  }
+
   const ownerAttendanceMatch = pathname.match(/^\/api\/owner\/lesson-sessions\/([^/]+)\/attendance$/)
   if (req.method === 'POST' && ownerAttendanceMatch) {
     if (!requireOwnerAuth(req, res)) return
@@ -909,6 +1135,25 @@ const handleApi = async (req, res, url) => {
     const childId = decodeURIComponent(subscriptionMatch[1])
     if (!state.families.some(family => family.id === childId)) return notFound(res)
     return json(res, 200, getChildSubscriptions(state, childId))
+  }
+
+  const adjustmentMatch = pathname.match(/^\/api\/owner\/children\/([^/]+)\/subscription-adjustments$/)
+  if (req.method === 'POST' && adjustmentMatch) {
+    if (!requireOwnerAuth(req, res)) return
+    const body = await readBody(req)
+    const childId = decodeURIComponent(adjustmentMatch[1])
+    const state = await readState()
+    if (!state.families.some(family => family.id === childId)) return notFound(res)
+    const result = adjustSubscriptionBalance(
+      state,
+      childId,
+      String(body.direction || ''),
+      body.amount,
+      body.note
+    )
+    if (result.error) return badRequest(res, result.error)
+    await saveState(state)
+    return json(res, 200, state)
   }
 
   const transactionMatch = pathname.match(/^\/api\/owner\/children\/([^/]+)\/subscription-transactions$/)

@@ -1,6 +1,7 @@
 {
-  "schemaVersion": 2,
+  "schemaVersion": 3,
   "families": [],
+  "parents": [],
   "lessonTemplates": [
     {
       "id": "04a7c5de-51a6-4ceb-a2a6-f551d52f4e66",

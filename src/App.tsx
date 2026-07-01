@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react'
+import { openCalendarEvent, type CalendarLesson } from './calendar.js'
 
 type ParentTab = 'schedule' | 'bookings' | 'profile'
 type OwnerTab = 'home' | 'lessons' | 'families' | 'attendance'
@@ -8,11 +9,21 @@ type SessionStatus = 'scheduled' | 'cancelled' | 'completed'
 
 type Family = {
   id: string
+  householdId: string
   phone: string
   firstName: string
   lastName: string
   childName: string
   paidLessons: number
+  createdAt: string
+}
+
+type ParentContact = {
+  id: string
+  householdId: string
+  phone: string
+  firstName: string
+  lastName: string
   createdAt: string
 }
 
@@ -92,6 +103,7 @@ type SubscriptionTransaction = {
 type AppState = {
   schemaVersion: number
   families: Family[]
+  parents: ParentContact[]
   lessonTemplates: LessonTemplate[]
   lessonSessions: LessonSession[]
   subscriptions: Subscription[]
@@ -104,7 +116,7 @@ type NewTemplate = {
   time: string
   duration: string
   description: string
-  capacity: string
+  capacity: number
 }
 
 type BeforeInstallPromptEvent = Event & {
@@ -159,15 +171,21 @@ const transactionLabels: Record<SubscriptionTransaction['type'], string> = {
 }
 
 const emptyState: AppState = {
-  schemaVersion: 2,
+  schemaVersion: 3,
   families: [],
+  parents: [],
   lessonTemplates: [],
   lessonSessions: [],
   subscriptions: [],
   subscriptionTransactions: []
 }
 
-const cleanPhone = (value: string) => value.replace(/[\s()-]/g, '')
+const cleanPhone = (value: string) => {
+  const digits = value.replace(/\D/g, '')
+  if (digits.length === 11 && digits.startsWith('8')) return `7${digits.slice(1)}`
+  if (digits.length === 10) return `7${digits}`
+  return digits
+}
 
 const todayIso = () => {
   const today = new Date()
@@ -199,8 +217,10 @@ const formatWeekdays = (values: Weekday[]) => {
 }
 
 const errorMessages: Record<string, string> = {
-  lesson_full: 'На занятии уже нет свободных мест.',
   no_lessons_left: 'В абонементе не осталось занятий.',
+  lesson_full: 'На занятии больше нет свободных мест.',
+  adjustment_exceeds_balance: 'Нельзя убрать больше занятий, чем осталось.',
+  phone_already_used: 'Этот телефон уже привязан к другой семье.',
   bad_request: 'Проверьте заполнение полей.',
   not_found: 'Данные не найдены. Обновите страницу.',
   unauthorized: 'Неверный пароль или сессия владельца завершена.',
@@ -242,7 +262,7 @@ const templateFromForm = (form: FormData): NewTemplate => ({
   time: String(form.get('time') || ''),
   duration: String(form.get('duration') || '').trim(),
   description: String(form.get('description') || '').trim(),
-  capacity: String(form.get('capacity') || '0')
+  capacity: Math.max(1, Number(form.get('capacity')) || 1)
 })
 
 const subscriptionSummary = (subscriptions: Subscription[]) => ({
@@ -261,6 +281,8 @@ export default function App() {
   const [installEvent, setInstallEvent] = useState<BeforeInstallPromptEvent | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
+  const [pendingCalendarEvent, setPendingCalendarEvent] = useState<CalendarLesson | null>(null)
+  const [calendarNotice, setCalendarNotice] = useState('')
   const syncVersion = useRef(0)
   const mutating = useRef(false)
   const normalizedPath = window.location.pathname.replace(/\/+$/, '') || '/'
@@ -271,6 +293,7 @@ export default function App() {
     ...emptyState,
     ...nextState,
     families: nextState.families || [],
+    parents: nextState.parents || [],
     lessonTemplates: nextState.lessonTemplates || [],
     lessonSessions: nextState.lessonSessions || [],
     subscriptions: nextState.subscriptions || [],
@@ -348,6 +371,9 @@ export default function App() {
   }, [])
 
   const currentFamily = state.families.find(family => family.id === currentFamilyId) || null
+  const currentParents = currentFamily
+    ? state.parents.filter(parent => parent.householdId === currentFamily.householdId)
+    : []
   const currentSubscriptions = state.subscriptions.filter(subscription => subscription.childId === currentFamilyId)
   const currentSummary = subscriptionSummary(currentSubscriptions)
 
@@ -386,7 +412,7 @@ export default function App() {
     if (!template.title || template.weekdays.length === 0 || !template.time || !template.duration) return
     const nextState = await api<AppState>('/api/lesson-templates', {
       method: 'POST',
-      body: JSON.stringify({ ...template, capacity: Math.max(1, Number(template.capacity) || 1) })
+      body: JSON.stringify(template)
     }, true)
     applyState(nextState)
   }
@@ -396,7 +422,7 @@ export default function App() {
     if (!template.title || template.weekdays.length === 0 || !template.time || !template.duration) return
     const nextState = await api<AppState>(`/api/lesson-templates/${encodeURIComponent(templateId)}`, {
       method: 'PUT',
-      body: JSON.stringify({ ...template, capacity: Math.max(1, Number(template.capacity) || 1) })
+      body: JSON.stringify(template)
     }, true)
     applyState(nextState)
   }
@@ -417,6 +443,31 @@ export default function App() {
       body: JSON.stringify({ childId: currentFamily.id })
     })
     applyState(nextState)
+    if (!booked) {
+      setCalendarNotice('')
+      setPendingCalendarEvent({
+        id: session.id,
+        title: session.titleSnapshot,
+        date: session.date,
+        time: session.timeSnapshot,
+        duration: session.durationSnapshot,
+        description: session.descriptionSnapshot
+      })
+    }
+  }
+
+  const confirmCalendarReminder = async () => {
+    if (!pendingCalendarEvent) return
+    try {
+      const result = await openCalendarEvent(pendingCalendarEvent)
+      if (result === 'downloaded') {
+        setCalendarNotice('Файл календаря скачан. Откройте его и подтвердите добавление события.')
+      }
+      setPendingCalendarEvent(null)
+    } catch (calendarError) {
+      console.error('Calendar handoff failed', calendarError)
+      setError('Не удалось открыть календарь. Попробуйте ещё раз.')
+    }
   }
 
   const setAttendance = async (sessionId: string, childId: string, status: AttendanceStatus) => {
@@ -442,6 +493,67 @@ export default function App() {
     const nextState = await api<AppState>(`/api/owner/children/${encodeURIComponent(childId)}/subscriptions`, {
       method: 'POST',
       body: JSON.stringify({ totalLessons, expiresAt: expiresAt || null, note })
+    }, true)
+    applyState(nextState)
+  }
+
+  const adjustSubscription = async (childId: string, direction: 'add' | 'remove', form: FormData) => {
+    const amount = Math.max(1, Number(form.get('amount')) || 0)
+    const note = String(form.get('note') || '').trim()
+    const nextState = await api<AppState>(`/api/owner/children/${encodeURIComponent(childId)}/subscription-adjustments`, {
+      method: 'POST',
+      body: JSON.stringify({ direction, amount, note })
+    }, true)
+    applyState(nextState)
+  }
+
+  const createHousehold = async (form: FormData) => {
+    const nextState = await api<AppState>('/api/owner/households', {
+      method: 'POST',
+      body: JSON.stringify({
+        parent: {
+          firstName: String(form.get('firstName') || '').trim(),
+          lastName: String(form.get('lastName') || '').trim(),
+          phone: cleanPhone(String(form.get('phone') || ''))
+        },
+        child: {
+          childName: String(form.get('childName') || '').trim(),
+          totalLessons: Math.max(0, Number(form.get('totalLessons')) || 0),
+          expiresAt: String(form.get('expiresAt') || '') || null
+        }
+      })
+    }, true)
+    applyState(nextState)
+  }
+
+  const addHouseholdParent = async (householdId: string, form: FormData) => {
+    const nextState = await api<AppState>(`/api/owner/households/${encodeURIComponent(householdId)}/parents`, {
+      method: 'POST',
+      body: JSON.stringify({
+        firstName: String(form.get('firstName') || '').trim(),
+        lastName: String(form.get('lastName') || '').trim(),
+        phone: cleanPhone(String(form.get('phone') || ''))
+      })
+    }, true)
+    applyState(nextState)
+  }
+
+  const addHouseholdChild = async (householdId: string, form: FormData) => {
+    const nextState = await api<AppState>(`/api/owner/households/${encodeURIComponent(householdId)}/children`, {
+      method: 'POST',
+      body: JSON.stringify({
+        childName: String(form.get('childName') || '').trim(),
+        totalLessons: Math.max(0, Number(form.get('totalLessons')) || 0),
+        expiresAt: String(form.get('expiresAt') || '') || null
+      })
+    }, true)
+    applyState(nextState)
+  }
+
+  const addSessionChild = async (sessionId: string, childId: string) => {
+    const nextState = await api<AppState>(`/api/owner/lesson-sessions/${encodeURIComponent(sessionId)}/children`, {
+      method: 'POST',
+      body: JSON.stringify({ childId })
     }, true)
     applyState(nextState)
   }
@@ -490,9 +602,18 @@ export default function App() {
       </header>
 
       {error ? <p className="error">{error}</p> : null}
+      {calendarNotice ? (
+        <div className="calendar-notice" role="status">
+          <span>{calendarNotice}</span>
+          <button type="button" className="plain" aria-label="Закрыть подсказку" onClick={() => setCalendarNotice('')}>×</button>
+        </div>
+      ) : null}
 
       {!isOwnerArea && currentFamily ? (
         <>
+          {state.families.length > 1 ? (
+            <ChildSwitcher families={state.families} activeId={currentFamily.id} onChange={setCurrentFamilyId} />
+          ) : null}
           {parentTab === 'schedule' ? (
             <ParentSchedule
               sessions={state.lessonSessions}
@@ -509,6 +630,7 @@ export default function App() {
           ) : (
             <ParentProfile
               family={currentFamily}
+              parents={currentParents}
               sessions={state.lessonSessions}
               subscriptions={currentSubscriptions}
             />
@@ -541,9 +663,14 @@ export default function App() {
           {ownerTab === 'families' && (
             <OwnerFamilies
               families={state.families}
+              parents={state.parents}
               subscriptions={state.subscriptions}
               transactions={state.subscriptionTransactions}
+              onCreateHousehold={form => run(() => createHousehold(form))}
+              onAddParent={(householdId, form) => run(() => addHouseholdParent(householdId, form))}
+              onAddChild={(householdId, form) => run(() => addHouseholdChild(householdId, form))}
               onAddSubscription={(childId, form) => run(() => addSubscription(childId, form))}
+              onAdjustSubscription={(childId, direction, form) => run(() => adjustSubscription(childId, direction, form))}
             />
           )}
           {ownerTab === 'attendance' && (
@@ -551,6 +678,7 @@ export default function App() {
               sessions={state.lessonSessions}
               families={state.families}
               subscriptions={state.subscriptions}
+              onAddChild={(sessionId, childId) => run(() => addSessionChild(sessionId, childId))}
               onSetAttendance={(sessionId, childId, status) => run(() => setAttendance(sessionId, childId, status))}
               onSaveComment={(sessionId, childId, text) => run(() => saveComment(sessionId, childId, text))}
             />
@@ -563,6 +691,13 @@ export default function App() {
           ]} active={ownerTab} onChange={id => setOwnerTab(id as OwnerTab)} />
         </>
       )}
+      {!isOwnerArea && pendingCalendarEvent ? (
+        <CalendarConfirmation
+          event={pendingCalendarEvent}
+          onConfirm={confirmCalendarReminder}
+          onCancel={() => setPendingCalendarEvent(null)}
+        />
+      ) : null}
     </main>
   )
 }
@@ -688,15 +823,50 @@ function BottomNav({ items, active, onChange }: { items: { id: string; label: st
   )
 }
 
+function CalendarConfirmation({ event, onConfirm, onCancel }: { event: CalendarLesson; onConfirm: () => void; onCancel: () => void }) {
+  return (
+    <div className="calendar-dialog-backdrop">
+      <section className="calendar-dialog" role="dialog" aria-modal="true" aria-labelledby="calendar-dialog-title">
+        <span className="eyebrow">Запись подтверждена</span>
+        <h2 id="calendar-dialog-title">Добавить напоминание?</h2>
+        <p><strong>{event.title}</strong></p>
+        <p>{formatDate(event.date)} · {event.time}</p>
+        <div className="calendar-reminder-detail">
+          <AppIcon name="schedule" />
+          <span>Напоминание за 1 час</span>
+        </div>
+        <div className="calendar-dialog-actions">
+          <button type="button" autoFocus onClick={onConfirm}>Добавить в календарь</button>
+          <button type="button" className="secondary" onClick={onCancel}>Не сейчас</button>
+        </div>
+      </section>
+    </div>
+  )
+}
+
 function StatusBadge({ tone, children }: { tone: 'success' | 'warning' | 'danger' | 'sky' | 'neutral'; children: ReactNode }) {
   return <span className={`status-badge ${tone}`}>{children}</span>
 }
 
+function ChildSwitcher({ families, activeId, onChange }: { families: Family[]; activeId: string; onChange: (id: string) => void }) {
+  return (
+    <div className="child-switcher" aria-label="Выбор ребёнка">
+      {families.map(family => (
+        <button
+          key={family.id}
+          type="button"
+          className={family.id === activeId ? 'active' : ''}
+          onClick={() => onChange(family.id)}
+        >
+          {family.childName}
+        </button>
+      ))}
+    </div>
+  )
+}
+
 function LessonCard({ session, booked, onAction, actionLabel, actionClass = '', disabled = false }: { session: LessonSession; booked?: boolean; onAction?: () => void; actionLabel?: string; actionClass?: string; disabled?: boolean }) {
   const bookedCount = session.bookedCount ?? session.bookedChildIds.length
-  const ratio = Math.min(100, Math.round((bookedCount / session.capacitySnapshot) * 100))
-  const spotsLeft = Math.max(0, session.capacitySnapshot - bookedCount)
-  const progressTone = spotsLeft === 0 ? 'full' : spotsLeft <= 2 ? 'low' : ''
   return (
     <article className="lesson-card">
       <img className="card-corner" src="/assets/card-corner-mountains.svg" alt="" />
@@ -707,12 +877,9 @@ function LessonCard({ session, booked, onAction, actionLabel, actionClass = '', 
       <h3>{session.titleSnapshot}</h3>
       <p className="lesson-duration">{session.durationSnapshot}</p>
       {session.descriptionSnapshot ? <p>{session.descriptionSnapshot}</p> : null}
-      <div className="capacity-row">
-        <span>{bookedCount} / {session.capacitySnapshot} мест</span>
-        {booked ? <StatusBadge tone="success">Вы записаны ✓</StatusBadge> : spotsLeft === 0 ? <StatusBadge tone="danger">Мест нет</StatusBadge> : null}
-      </div>
-      <div className={`capacity-track ${progressTone}`} aria-hidden="true">
-        <span style={{ width: `${ratio}%` }} />
+      <div className="booking-row">
+        <span>Записано: {bookedCount} из {session.capacitySnapshot}</span>
+        {booked ? <StatusBadge tone="success">Вы записаны ✓</StatusBadge> : null}
       </div>
       {onAction && actionLabel ? (
         <button type="button" className={actionClass} disabled={disabled} onClick={onAction}>{actionLabel}</button>
@@ -739,9 +906,8 @@ function ParentSchedule({ sessions, currentFamily, remaining, onToggleBooking }:
       ) : null}
       {visibleSessions.length === 0 ? <p>Занятий пока нет.</p> : visibleSessions.map(session => {
         const booked = session.bookedChildIds.includes(currentFamily.id)
-        const bookedCount = session.bookedCount ?? session.bookedChildIds.length
-        const full = bookedCount >= session.capacitySnapshot
-        const disabled = !booked && (full || remaining < 1)
+        const full = !booked && (session.bookedCount ?? session.bookedChildIds.length) >= session.capacitySnapshot
+        const disabled = !booked && (remaining < 1 || full)
         return <LessonCard
           key={session.id}
           session={session}
@@ -791,7 +957,7 @@ function ParentBookings({ family, sessions, onCancel }: { family: Family; sessio
   )
 }
 
-function ParentProfile({ family, sessions, subscriptions }: { family: Family; sessions: LessonSession[]; subscriptions: Subscription[] }) {
+function ParentProfile({ family, parents, sessions, subscriptions }: { family: Family; parents: ParentContact[]; sessions: LessonSession[]; subscriptions: Subscription[] }) {
   const summary = subscriptionSummary(subscriptions)
   const upcoming = sessions
     .filter(session => session.date >= todayIso() && session.status === 'scheduled' && session.bookedChildIds.includes(family.id))
@@ -804,7 +970,11 @@ function ParentProfile({ family, sessions, subscriptions }: { family: Family; se
     <section className="screen-section">
       <article className="child-profile-card">
         <ChildAvatar name={family.childName} />
-        <div><span className="eyebrow">Ваш ребенок</span><h2>{family.childName}</h2><p>{family.firstName} {family.lastName} · {family.phone}</p></div>
+        <div>
+          <span className="eyebrow">Ваш ребенок</span>
+          <h2>{family.childName}</h2>
+          {parents.map(parent => <p key={parent.id}>{parent.firstName} {parent.lastName} · {parent.phone}</p>)}
+        </div>
       </article>
 
       <article className="subscription-card">
@@ -893,7 +1063,7 @@ function TemplateForm({ initial, submitLabel, onSubmit }: { initial?: LessonTemp
       </fieldset>
       <label>Время<input name="time" type="time" defaultValue={initial?.time} required /></label>
       <label>Длительность<input name="duration" defaultValue={initial?.duration} placeholder="60 минут" required /></label>
-      <label>Мест<input name="capacity" type="number" min="1" defaultValue={initial?.capacity || 8} required /></label>
+      <label>Максимальное количество детей<input name="capacity" type="number" min="1" defaultValue={initial?.capacity ?? 10} required /></label>
       <label>Описание<textarea name="description" defaultValue={initial?.description} placeholder="Что будет на занятии" /></label>
       <button type="submit">{submitLabel}</button>
     </form>
@@ -920,7 +1090,6 @@ function OwnerLessons({ templates, sessions, onAdd, onUpdate, onRemove }: { temp
           <h3>{template.title}</h3>
           <p>{template.duration}</p>
           {template.description ? <p>{template.description}</p> : null}
-          <p>Мест: {template.capacity}</p>
           <div className="inline-actions">
             <button type="button" className="secondary" onClick={() => setEditingId(editingId === template.id ? '' : template.id)}>
               {editingId === template.id ? 'Закрыть' : 'Изменить'}
@@ -939,67 +1108,182 @@ function OwnerLessons({ templates, sessions, onAdd, onUpdate, onRemove }: { temp
   )
 }
 
-function OwnerFamilies({ families, subscriptions, transactions, onAddSubscription }: { families: Family[]; subscriptions: Subscription[]; transactions: SubscriptionTransaction[]; onAddSubscription: (childId: string, form: FormData) => void }) {
+function OwnerFamilies({
+  families,
+  parents,
+  subscriptions,
+  transactions,
+  onCreateHousehold,
+  onAddParent,
+  onAddChild,
+  onAddSubscription,
+  onAdjustSubscription
+}: {
+  families: Family[]
+  parents: ParentContact[]
+  subscriptions: Subscription[]
+  transactions: SubscriptionTransaction[]
+  onCreateHousehold: (form: FormData) => void
+  onAddParent: (householdId: string, form: FormData) => void
+  onAddChild: (householdId: string, form: FormData) => void
+  onAddSubscription: (childId: string, form: FormData) => void
+  onAdjustSubscription: (childId: string, direction: 'add' | 'remove', form: FormData) => void
+}) {
   const [query, setQuery] = useState('')
   const [filter, setFilter] = useState<'all' | 'active' | 'none'>('all')
-  const visibleFamilies = families.filter(family => {
-    const remaining = subscriptionSummary(subscriptions.filter(item => item.childId === family.id)).remaining
-    const matchesQuery = `${family.childName} ${family.firstName} ${family.lastName}`.toLowerCase().includes(query.toLowerCase())
-    const matchesFilter = filter === 'all' || (filter === 'active' ? remaining > 0 : remaining < 1)
-    return matchesQuery && matchesFilter
+  const [openForm, setOpenForm] = useState('')
+  const householdIds = [...new Set(families.map(family => family.householdId))]
+  const visibleHouseholds = householdIds.filter(householdId => {
+    const householdChildren = families.filter(family => family.householdId === householdId)
+    const householdParents = parents.filter(parent => parent.householdId === householdId)
+    const searchable = [
+      ...householdChildren.map(child => child.childName),
+      ...householdParents.flatMap(parent => [parent.firstName, parent.lastName, parent.phone])
+    ].join(' ').toLowerCase()
+    const balances = householdChildren.map(child => subscriptionSummary(subscriptions.filter(item => item.childId === child.id)).remaining)
+    const matchesFilter = filter === 'all' || (filter === 'active' ? balances.some(value => value > 0) : balances.some(value => value < 1))
+    return searchable.includes(query.toLowerCase()) && matchesFilter
   })
+
   return (
     <section className="screen-section">
-      <div className="section-heading"><div><span className="eyebrow">База студии</span><h2>Дети и абонементы</h2></div><AppIcon name="children" /></div>
-      <label className="search-field">Поиск по имени<input type="search" value={query} onChange={event => setQuery(event.target.value)} placeholder="Начните вводить имя" /></label>
+      <div className="section-heading">
+        <div><span className="eyebrow">База студии</span><h2>Семьи и абонементы</h2></div>
+        <button type="button" className="icon-command" title="Добавить семью" onClick={() => setOpenForm(openForm === 'new-household' ? '' : 'new-household')}>+</button>
+      </div>
+      {openForm === 'new-household' ? (
+        <form className="inline-form household-form" onSubmit={event => {
+          event.preventDefault()
+          onCreateHousehold(new FormData(event.currentTarget))
+          event.currentTarget.reset()
+          setOpenForm('')
+        }}>
+          <div className="form-title"><AppIcon name="children" /><h3>Новая семья</h3></div>
+          <label>Имя родителя<input name="firstName" required /></label>
+          <label>Фамилия родителя<input name="lastName" required /></label>
+          <label>Телефон<input name="phone" type="tel" required /></label>
+          <label>Имя ребёнка<input name="childName" required /></label>
+          <label>Занятий в абонементе<input name="totalLessons" type="number" min="0" defaultValue="0" /></label>
+          <label>Действует до<input name="expiresAt" type="date" /></label>
+          <button type="submit">Создать семью</button>
+        </form>
+      ) : null}
+      <label className="search-field">Поиск по семье<input type="search" value={query} onChange={event => setQuery(event.target.value)} placeholder="Ребёнок, родитель или телефон" /></label>
       <div className="filter-tabs">
         <button type="button" className={filter === 'all' ? 'active' : ''} onClick={() => setFilter('all')}>Все</button>
         <button type="button" className={filter === 'active' ? 'active' : ''} onClick={() => setFilter('active')}>С абонементом</button>
         <button type="button" className={filter === 'none' ? 'active' : ''} onClick={() => setFilter('none')}>Без абонемента</button>
       </div>
-      {visibleFamilies.length === 0 ? <div className="empty-state"><AppIcon name="children" /><p>Подходящих детей нет.</p></div> : visibleFamilies.map(family => {
-        const childSubscriptions = subscriptions.filter(item => item.childId === family.id)
-        const summary = subscriptionSummary(childSubscriptions)
-        const childTransactions = transactions
-          .filter(item => item.childId === family.id)
-          .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
-          .slice(0, 6)
+      {visibleHouseholds.length === 0 ? <div className="empty-state"><AppIcon name="children" /><p>Подходящих семей нет.</p></div> : visibleHouseholds.map(householdId => {
+        const householdChildren = families.filter(family => family.householdId === householdId)
+        const householdParents = parents.filter(parent => parent.householdId === householdId)
         return (
-          <article className="child-card" key={family.id}>
-            <div className="child-card-head">
-              <ChildAvatar name={family.childName} />
-              <div><h3>{family.childName}</h3><p>{family.firstName} {family.lastName}</p><p>{family.phone}</p></div>
-              <StatusBadge tone={summary.remaining > 2 ? 'success' : summary.remaining > 0 ? 'warning' : 'danger'}>
-                {summary.remaining > 0 ? `${summary.remaining} занятий` : 'Нет абонемента'}
-              </StatusBadge>
-            </div>
-            <dl>
-              <div><dt>Оплачено</dt><dd>{summary.total}</dd></div>
-              <div><dt>Использовано</dt><dd>{summary.used}</dd></div>
-              <div><dt>Осталось</dt><dd>{summary.remaining}</dd></div>
-            </dl>
-            <form className="inline-form" onSubmit={event => {
-              event.preventDefault()
-              onAddSubscription(family.id, new FormData(event.currentTarget))
-              event.currentTarget.reset()
-            }}>
-              <div className="form-title"><AppIcon name="subscription" /><h3>Новый абонемент</h3></div>
-              <label>Количество занятий<input name="totalLessons" type="number" min="1" defaultValue="8" required /></label>
-              <label>Действует до<input name="expiresAt" type="date" /></label>
-              <label>Примечание<input name="note" placeholder="Оплата за июль" /></label>
-              <button type="submit">Выдать абонемент</button>
-            </form>
-            {childTransactions.length > 0 ? (
-              <div className="transaction-list">
-                <h3>Последние операции</h3>
-                {childTransactions.map(transaction => (
-                  <p key={transaction.id}>
-                    {transactionLabels[transaction.type]}: {transaction.amount} · {new Date(transaction.createdAt).toLocaleDateString('ru-RU')}
-                  </p>
-                ))}
+          <section className="household-block" key={householdId}>
+            <div className="household-head">
+              <div>
+                <span className="eyebrow">Родители</span>
+                {householdParents.map(parent => <p key={parent.id}><strong>{parent.firstName} {parent.lastName}</strong><span>{parent.phone}</span></p>)}
               </div>
+              <div className="household-actions">
+                <button type="button" className="secondary" onClick={() => setOpenForm(openForm === `parent-${householdId}` ? '' : `parent-${householdId}`)}>+ Родитель</button>
+                <button type="button" className="secondary" onClick={() => setOpenForm(openForm === `child-${householdId}` ? '' : `child-${householdId}`)}>+ Ребёнок</button>
+              </div>
+            </div>
+            {openForm === `parent-${householdId}` ? (
+              <form className="inline-form household-form" onSubmit={event => {
+                event.preventDefault()
+                onAddParent(householdId, new FormData(event.currentTarget))
+                event.currentTarget.reset()
+                setOpenForm('')
+              }}>
+                <div className="form-title"><AppIcon name="profile" /><h3>Новый родитель</h3></div>
+                <label>Имя<input name="firstName" required /></label>
+                <label>Фамилия<input name="lastName" required /></label>
+                <label>Телефон<input name="phone" type="tel" required /></label>
+                <button type="submit">Добавить родителя</button>
+              </form>
             ) : null}
-          </article>
+            {openForm === `child-${householdId}` ? (
+              <form className="inline-form household-form" onSubmit={event => {
+                event.preventDefault()
+                onAddChild(householdId, new FormData(event.currentTarget))
+                event.currentTarget.reset()
+                setOpenForm('')
+              }}>
+                <div className="form-title"><AppIcon name="children" /><h3>Новый ребёнок</h3></div>
+                <label>Имя ребёнка<input name="childName" required /></label>
+                <label>Занятий в абонементе<input name="totalLessons" type="number" min="0" defaultValue="0" /></label>
+                <label>Действует до<input name="expiresAt" type="date" /></label>
+                <button type="submit">Добавить ребёнка</button>
+              </form>
+            ) : null}
+            <div className="household-children">
+              {householdChildren.map(family => {
+                const summary = subscriptionSummary(subscriptions.filter(item => item.childId === family.id))
+                const childTransactions = transactions
+                  .filter(item => item.childId === family.id)
+                  .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+                  .slice(0, 3)
+                return (
+                  <div className="child-record" key={family.id}>
+                    <div className="child-card-head">
+                      <ChildAvatar name={family.childName} />
+                      <div><h3>{family.childName}</h3><p>Оплачено: {summary.total} · посещено: {summary.used}</p></div>
+                      <StatusBadge tone={summary.remaining > 2 ? 'success' : summary.remaining > 0 ? 'warning' : 'danger'}>
+                        {summary.remaining > 0 ? `${summary.remaining} осталось` : 'Нет абонемента'}
+                      </StatusBadge>
+                    </div>
+                    <button type="button" className="secondary full-width" onClick={() => setOpenForm(openForm === `subscription-${family.id}` ? '' : `subscription-${family.id}`)}>
+                      Выдать абонемент
+                    </button>
+                    <div className="inline-actions">
+                      <button type="button" className="secondary" onClick={() => setOpenForm(openForm === `adjust-add-${family.id}` ? '' : `adjust-add-${family.id}`)}>
+                        + Занятия
+                      </button>
+                      <button type="button" className="secondary" disabled={summary.remaining < 1} onClick={() => setOpenForm(openForm === `adjust-remove-${family.id}` ? '' : `adjust-remove-${family.id}`)}>
+                        − Занятия
+                      </button>
+                    </div>
+                    {openForm === `subscription-${family.id}` ? (
+                      <form className="inline-form" onSubmit={event => {
+                        event.preventDefault()
+                        onAddSubscription(family.id, new FormData(event.currentTarget))
+                        event.currentTarget.reset()
+                        setOpenForm('')
+                      }}>
+                        <label>Количество занятий<input name="totalLessons" type="number" min="1" defaultValue="8" required /></label>
+                        <label>Действует до<input name="expiresAt" type="date" /></label>
+                        <label>Примечание<input name="note" placeholder="Оплата за июль" /></label>
+                        <button type="submit">Сохранить абонемент</button>
+                      </form>
+                    ) : null}
+                    {openForm === `adjust-add-${family.id}` || openForm === `adjust-remove-${family.id}` ? (() => {
+                      const direction = openForm.startsWith('adjust-add-') ? 'add' : 'remove'
+                      return (
+                        <form className="inline-form" onSubmit={event => {
+                          event.preventDefault()
+                          onAdjustSubscription(family.id, direction, new FormData(event.currentTarget))
+                          event.currentTarget.reset()
+                          setOpenForm('')
+                        }}>
+                          <label>Количество занятий<input name="amount" type="number" min="1" max={direction === 'remove' ? summary.remaining : undefined} defaultValue="1" required /></label>
+                          <label>Примечание<input name="note" placeholder={direction === 'add' ? 'Доплата' : 'Перерасчёт'} /></label>
+                          <button type="submit">{direction === 'add' ? 'Добавить занятия' : 'Убрать занятия'}</button>
+                        </form>
+                      )
+                    })() : null}
+                    {childTransactions.length > 0 ? (
+                      <div className="transaction-list">
+                        {childTransactions.map(transaction => (
+                          <p key={transaction.id}>{transaction.type === 'manual_adjustment' ? transaction.reason : transactionLabels[transaction.type]}: {transaction.amount} · {new Date(transaction.createdAt).toLocaleDateString('ru-RU')}</p>
+                        ))}
+                      </div>
+                    ) : null}
+                  </div>
+                )
+              })}
+            </div>
+          </section>
         )
       })}
     </section>
@@ -1022,7 +1306,7 @@ function CommentEditor({ value, onSave }: { value: string; onSave: (text: string
   )
 }
 
-function OwnerAttendance({ sessions, families, subscriptions, onSetAttendance, onSaveComment }: { sessions: LessonSession[]; families: Family[]; subscriptions: Subscription[]; onSetAttendance: (sessionId: string, childId: string, status: AttendanceStatus) => void; onSaveComment: (sessionId: string, childId: string, text: string) => void }) {
+function OwnerAttendance({ sessions, families, subscriptions, onAddChild, onSetAttendance, onSaveComment }: { sessions: LessonSession[]; families: Family[]; subscriptions: Subscription[]; onAddChild: (sessionId: string, childId: string) => void; onSetAttendance: (sessionId: string, childId: string, status: AttendanceStatus) => void; onSaveComment: (sessionId: string, childId: string, text: string) => void }) {
   const availableSessions = sessions
     .filter(session => session.status !== 'cancelled')
     .sort(sortSessions)
@@ -1032,6 +1316,7 @@ function OwnerAttendance({ sessions, families, subscriptions, onSetAttendance, o
   const dateSessions = availableSessions.filter(session => session.date === selectedDate)
   const preferred = dateSessions[0]
   const [selectedId, setSelectedId] = useState(() => preferred?.id || '')
+  const [walkInChildId, setWalkInChildId] = useState('')
   const selectedSession = dateSessions.find(session => session.id === selectedId) || preferred
 
   useEffect(() => {
@@ -1060,9 +1345,27 @@ function OwnerAttendance({ sessions, families, subscriptions, onSetAttendance, o
 
       {!selectedSession ? <div className="empty-state"><AppIcon name="schedule" /><p>На выбранную дату занятий нет.</p></div> : (() => {
         const bookedFamilies = families.filter(family => selectedSession.bookedChildIds.includes(family.id))
+        const availableChildren = families.filter(family => !selectedSession.bookedChildIds.includes(family.id))
         const missingComments = bookedFamilies.filter(family => !selectedSession.comments[family.id]?.text).length
         return (
           <>
+            {availableChildren.length > 0 ? (
+              <div className="walk-in-control">
+                <label>
+                  Добавить из базы
+                  <select value={walkInChildId} onChange={event => setWalkInChildId(event.target.value)}>
+                    <option value="">Выберите ребёнка</option>
+                    {availableChildren
+                      .sort((a, b) => a.childName.localeCompare(b.childName, 'ru'))
+                      .map(family => <option key={family.id} value={family.id}>{family.childName} · {family.firstName} {family.lastName}</option>)}
+                  </select>
+                </label>
+                <button type="button" disabled={!walkInChildId} onClick={() => {
+                  onAddChild(selectedSession.id, walkInChildId)
+                  setWalkInChildId('')
+                }}>+ Добавить ребёнка</button>
+              </div>
+            ) : null}
             <div className="comments-counter">Комментариев не заполнено: <strong>{missingComments}</strong></div>
             {bookedFamilies.length === 0 ? <p>На это занятие никто не записан.</p> : bookedFamilies.map(family => {
         const record = selectedSession.attendance[family.id]
