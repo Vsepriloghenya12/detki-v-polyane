@@ -14,6 +14,7 @@ const stateFile = process.env.STATE_FILE || path.join(dataDir, 'state.json')
 const port = Number(process.env.PORT || 3000)
 const usePostgres = Boolean(process.env.DATABASE_URL)
 const isLocalDevelopment = !process.env.RAILWAY_ENVIRONMENT && process.env.NODE_ENV !== 'production'
+const ownerLogin = process.env.OWNER_LOGIN || 'admin'
 const ownerPassword = process.env.OWNER_PASSWORD || (isLocalDevelopment ? 'detki-owner-dev' : '')
 const ownerTokens = new Set()
 let pool = null
@@ -35,6 +36,7 @@ const cleanPhone = value => {
   if (digits.length === 10) return `7${digits}`
   return digits
 }
+const isValidPhone = value => /^7\d{10}$/.test(value)
 
 const moscowToday = () => {
   const parts = new Intl.DateTimeFormat('en', {
@@ -805,7 +807,10 @@ const handleApi = async (req, res, url) => {
   if (req.method === 'POST' && pathname === '/api/owner/login') {
     if (!ownerPassword) return json(res, 503, { error: 'owner_password_not_configured' })
     const body = await readBody(req)
-    if (!safePasswordEqual(body.password, ownerPassword)) return unauthorized(res)
+    const submittedLogin = String(body.login || ownerLogin)
+    if (!safePasswordEqual(submittedLogin, ownerLogin) || !safePasswordEqual(body.password, ownerPassword)) {
+      return unauthorized(res)
+    }
     const token = crypto.randomBytes(32).toString('hex')
     ownerTokens.add(token)
     return json(res, 200, { token })
@@ -843,15 +848,16 @@ const handleApi = async (req, res, url) => {
     const firstName = String(body.firstName || '').trim()
     const lastName = String(body.lastName || '').trim()
     const childName = String(body.childName || '').trim()
-    if (!phone) return badRequest(res)
+    if (!isValidPhone(phone)) return badRequest(res)
     const state = await readState()
     const existingParent = state.parents.find(parent => cleanPhone(parent.phone) === phone)
     let family
     if (existingParent) {
+      if (body.register === true) return badRequest(res, 'family_already_exists')
       family = state.families.find(item => item.householdId === existingParent.householdId)
       if (!family) return notFound(res)
     } else {
-      if (!firstName || !lastName || !childName) return badRequest(res)
+      if (!firstName || !lastName || !childName) return badRequest(res, 'family_not_found')
       const householdId = uid()
       const createdAt = nowIso()
       family = normalizeFamily({ id: uid(), householdId, phone, firstName, lastName, childName, paidLessons: 0, createdAt })

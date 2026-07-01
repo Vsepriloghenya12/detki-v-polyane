@@ -1,5 +1,5 @@
-const cacheName = 'detki-v-polyane-v4'
-const files = ['/', '/owner', '/manifest.webmanifest', '/icon.svg', '/icon-192.png', '/icon-512.png']
+const cacheName = 'detki-v-polyane-v5'
+const files = ['/', '/manifest.webmanifest', '/icon.svg', '/icon-192.png', '/icon-512.png']
 
 self.addEventListener('install', event => {
   event.waitUntil(caches.open(cacheName).then(cache => cache.addAll(files)))

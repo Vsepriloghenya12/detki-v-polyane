@@ -1,8 +1,11 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { openCalendarEvent, type CalendarLesson } from './calendar.js'
+import { loginKind, normalizePhone } from './login.js'
 
 type ParentTab = 'schedule' | 'bookings' | 'profile'
 type OwnerTab = 'home' | 'lessons' | 'families' | 'attendance'
+type EntryMode = 'login' | 'owner' | 'register'
+type EntryTab = 'login' | 'register'
 type Weekday = 'mon' | 'tue' | 'wed' | 'thu' | 'fri' | 'sat' | 'sun'
 type AttendanceStatus = 'present' | 'absent' | 'late' | 'sick' | 'cancelled'
 type SessionStatus = 'scheduled' | 'cancelled' | 'completed'
@@ -126,10 +129,12 @@ type BeforeInstallPromptEvent = Event & {
 
 class ApiError extends Error {
   status: number
+  code: string
 
-  constructor(message: string, status: number) {
+  constructor(message: string, status: number, code: string) {
     super(message)
     this.status = status
+    this.code = code
   }
 }
 
@@ -180,13 +185,6 @@ const emptyState: AppState = {
   subscriptionTransactions: []
 }
 
-const cleanPhone = (value: string) => {
-  const digits = value.replace(/\D/g, '')
-  if (digits.length === 11 && digits.startsWith('8')) return `7${digits.slice(1)}`
-  if (digits.length === 10) return `7${digits}`
-  return digits
-}
-
 const todayIso = () => {
   const today = new Date()
   const year = today.getFullYear()
@@ -220,10 +218,13 @@ const errorMessages: Record<string, string> = {
   no_lessons_left: 'В абонементе не осталось занятий.',
   lesson_full: 'На занятии больше нет свободных мест.',
   adjustment_exceeds_balance: 'Нельзя убрать больше занятий, чем осталось.',
+  family_not_found: 'Пользователь не найден.',
+  family_already_exists: 'Этот номер уже зарегистрирован.',
+  invalid_identifier: 'Введите корректный номер телефона или логин.',
   phone_already_used: 'Этот телефон уже привязан к другой семье.',
   bad_request: 'Проверьте заполнение полей.',
   not_found: 'Данные не найдены. Обновите страницу.',
-  unauthorized: 'Неверный пароль или сессия владельца завершена.',
+  unauthorized: 'Неверный логин или пароль.',
   owner_password_not_configured: 'На сервере не настроен пароль владельца.',
   server_error: 'Ошибка сервера. Попробуйте еще раз.'
 }
@@ -251,7 +252,7 @@ const api = async <T,>(url: string, options?: RequestInit, owner = false): Promi
   const data = await response.json().catch(() => null)
   if (!response.ok) {
     const code = data?.error || 'server_error'
-    throw new ApiError(errorMessages[code] || errorMessages.server_error, response.status)
+    throw new ApiError(errorMessages[code] || errorMessages.server_error, response.status, code)
   }
   return data as T
 }
@@ -283,11 +284,14 @@ export default function App() {
   const [error, setError] = useState('')
   const [pendingCalendarEvent, setPendingCalendarEvent] = useState<CalendarLesson | null>(null)
   const [calendarNotice, setCalendarNotice] = useState('')
+  const [entryMode, setEntryMode] = useState<EntryMode>('login')
+  const [entryIdentifier, setEntryIdentifier] = useState('')
+  const [entrySuggestion, setEntrySuggestion] = useState<EntryTab | ''>('')
   const syncVersion = useRef(0)
   const mutating = useRef(false)
   const normalizedPath = window.location.pathname.replace(/\/+$/, '') || '/'
-  const isOwnerArea = normalizedPath === '/owner' || normalizedPath === '/owner/login'
-  const isOwnerLogin = normalizedPath === '/owner/login'
+  const isOwnerMode = Boolean(ownerToken)
+  const isLegacyOwnerPath = normalizedPath === '/owner' || normalizedPath === '/owner/login'
 
   const applyState = (nextState: AppState) => setState({
     ...emptyState,
@@ -301,26 +305,28 @@ export default function App() {
   })
 
   const handleOwnerUnauthorized = (requestError: unknown) => {
-    if (requestError instanceof ApiError && requestError.status === 401 && isOwnerArea) {
+    if (requestError instanceof ApiError && requestError.status === 401 && ownerToken) {
       localStorage.removeItem(ownerTokenStorageKey)
       setOwnerToken('')
-      window.location.replace('/owner/login')
+      applyState(emptyState)
+      setEntryMode('login')
+      setEntrySuggestion('')
       return true
     }
     return false
   }
 
   const syncState = async (silent = false) => {
-    if (isOwnerLogin && !ownerToken) {
-      setLoading(false)
+    if (!ownerToken && !currentFamilyId) {
+      if (!silent) setLoading(false)
       return
     }
     const version = syncVersion.current
     try {
-      const url = isOwnerArea
+      const url = ownerToken
         ? '/api/owner/state'
         : `/api/state${currentFamilyId ? `?familyId=${encodeURIComponent(currentFamilyId)}` : ''}`
-      const nextState = await api<AppState>(url, undefined, isOwnerArea)
+      const nextState = await api<AppState>(url, undefined, Boolean(ownerToken))
       if (!mutating.current && version === syncVersion.current) applyState(nextState)
       if (!silent) setError('')
     } catch (requestError) {
@@ -348,12 +354,8 @@ export default function App() {
   }
 
   useEffect(() => {
-    if (isOwnerArea && !isOwnerLogin && !ownerToken) {
-      window.location.replace('/owner/login')
-      return
-    }
-    if (isOwnerLogin && ownerToken) {
-      window.location.replace('/owner')
+    if (isLegacyOwnerPath) {
+      window.location.replace('/')
       return
     }
     syncState()
@@ -377,34 +379,103 @@ export default function App() {
   const currentSubscriptions = state.subscriptions.filter(subscription => subscription.childId === currentFamilyId)
   const currentSummary = subscriptionSummary(currentSubscriptions)
 
+  const activateParent = (result: { state: AppState; family: Family }) => {
+    localStorage.removeItem(ownerTokenStorageKey)
+    setOwnerToken('')
+    applyState(result.state)
+    setCurrentFamilyId(result.family.id)
+    setEntryMode('login')
+    setEntrySuggestion('')
+  }
+
+  const startLogin = async () => {
+    const identifier = entryIdentifier.trim()
+    const kind = loginKind(identifier)
+    if (kind === 'invalid') {
+      setError(errorMessages.invalid_identifier)
+      return
+    }
+    if (kind === 'owner') {
+      setEntryMode('owner')
+      return
+    }
+
+    try {
+      const result = await api<{ state: AppState; family: Family }>('/api/families', {
+        method: 'POST',
+        body: JSON.stringify({ phone: normalizePhone(identifier) })
+      })
+      activateParent(result)
+    } catch (requestError) {
+      if (requestError instanceof ApiError && requestError.code === 'family_not_found') {
+        setError(errorMessages.family_not_found)
+        setEntrySuggestion('register')
+        return
+      }
+      throw requestError
+    }
+  }
+
   const saveFamily = async (form: FormData) => {
-    const phone = cleanPhone(String(form.get('phone') || ''))
+    const phone = normalizePhone(String(form.get('phone') || ''))
     const firstName = String(form.get('firstName') || '').trim()
     const lastName = String(form.get('lastName') || '').trim()
     const childName = String(form.get('childName') || '').trim()
-    if (!phone || !firstName || !lastName || !childName) return
-    const result = await api<{ state: AppState; family: Family }>('/api/families', {
-      method: 'POST',
-      body: JSON.stringify({ phone, firstName, lastName, childName })
-    })
-    applyState(result.state)
-    setCurrentFamilyId(result.family.id)
+    if (!phone || !firstName || !lastName || !childName) {
+      setError(errorMessages.invalid_identifier)
+      return
+    }
+    try {
+      const result = await api<{ state: AppState; family: Family }>('/api/families', {
+        method: 'POST',
+        body: JSON.stringify({ register: true, phone, firstName, lastName, childName })
+      })
+      activateParent(result)
+    } catch (requestError) {
+      if (requestError instanceof ApiError && requestError.code === 'family_already_exists') {
+        setError(errorMessages.family_already_exists)
+        setEntrySuggestion('login')
+        return
+      }
+      throw requestError
+    }
   }
 
-  const loginOwner = async (password: string) => {
+  const loginOwner = async (login: string, password: string) => {
     const result = await api<{ token: string }>('/api/owner/login', {
       method: 'POST',
-      body: JSON.stringify({ password })
+      body: JSON.stringify({ login: login.trim(), password })
     })
+    setCurrentFamilyId('')
+    applyState(emptyState)
+    setLoading(true)
     localStorage.setItem(ownerTokenStorageKey, JSON.stringify(result.token))
     setOwnerToken(result.token)
-    window.location.replace('/owner')
+    setEntryMode('login')
+    setEntrySuggestion('')
   }
 
   const logoutOwner = () => {
     localStorage.removeItem(ownerTokenStorageKey)
     setOwnerToken('')
-    window.location.href = '/owner/login'
+    applyState(emptyState)
+    setEntryMode('login')
+    setEntryIdentifier('')
+    setEntrySuggestion('')
+  }
+
+  const logoutParent = () => {
+    setCurrentFamilyId('')
+    applyState(emptyState)
+    setEntryMode('login')
+    setEntryIdentifier('')
+    setEntrySuggestion('')
+  }
+
+  const selectEntryTab = (tab: EntryTab) => {
+    setEntryMode(tab)
+    setEntrySuggestion('')
+    setError('')
   }
 
   const addTemplate = async (form: FormData) => {
@@ -514,7 +585,7 @@ export default function App() {
         parent: {
           firstName: String(form.get('firstName') || '').trim(),
           lastName: String(form.get('lastName') || '').trim(),
-          phone: cleanPhone(String(form.get('phone') || ''))
+          phone: normalizePhone(String(form.get('phone') || ''))
         },
         child: {
           childName: String(form.get('childName') || '').trim(),
@@ -532,7 +603,7 @@ export default function App() {
       body: JSON.stringify({
         firstName: String(form.get('firstName') || '').trim(),
         lastName: String(form.get('lastName') || '').trim(),
-        phone: cleanPhone(String(form.get('phone') || ''))
+        phone: normalizePhone(String(form.get('phone') || ''))
       })
     }, true)
     applyState(nextState)
@@ -565,23 +636,29 @@ export default function App() {
     setInstallEvent(null)
   }
 
-  if (isOwnerLogin && !ownerToken) {
-    return <OwnerLogin onLogin={password => run(() => loginOwner(password))} error={error} />
-  }
-
-  if (isOwnerArea && !ownerToken) {
-    return <LoadingScreen />
-  }
-
   if (loading) {
     return <LoadingScreen />
   }
 
-  if (!isOwnerArea && !currentFamily) {
-    return <Welcome onRegister={form => run(() => saveFamily(form))} installEvent={installEvent} installApp={installApp} error={error} />
+  if (!isOwnerMode && !currentFamily) {
+    return (
+      <UnifiedEntry
+        mode={entryMode}
+        identifier={entryIdentifier}
+        onIdentifierChange={setEntryIdentifier}
+        onContinue={() => run(startLogin)}
+        onOwnerLogin={password => run(() => loginOwner(entryIdentifier, password))}
+        onRegister={form => run(() => saveFamily(form))}
+        onSelectTab={selectEntryTab}
+        suggestedTab={entrySuggestion}
+        installEvent={installEvent}
+        installApp={installApp}
+        error={error}
+      />
+    )
   }
 
-  const sectionTitle = isOwnerArea
+  const sectionTitle = isOwnerMode
     ? ownerTab === 'home' ? 'Главная' : ownerTab === 'lessons' ? 'Занятия' : ownerTab === 'families' ? 'Дети' : 'Учет'
     : parentTab === 'schedule' ? 'Расписание' : parentTab === 'bookings' ? 'Мои записи' : 'Профиль'
 
@@ -592,12 +669,12 @@ export default function App() {
           <AppIcon name="mountain" />
           <strong>{sectionTitle}</strong>
         </div>
-        {isOwnerArea ? (
+        {isOwnerMode ? (
           <button type="button" className="plain header-action" onClick={logoutOwner}>Выйти</button>
         ) : installEvent ? (
           <button type="button" className="plain" onClick={installApp}>Установить</button>
         ) : (
-          <button type="button" className="plain header-action" onClick={() => setCurrentFamilyId('')}>Выйти</button>
+          <button type="button" className="plain header-action" onClick={logoutParent}>Выйти</button>
         )}
       </header>
 
@@ -609,7 +686,7 @@ export default function App() {
         </div>
       ) : null}
 
-      {!isOwnerArea && currentFamily ? (
+      {!isOwnerMode && currentFamily ? (
         <>
           {state.families.length > 1 ? (
             <ChildSwitcher families={state.families} activeId={currentFamily.id} onChange={setCurrentFamilyId} />
@@ -691,7 +768,7 @@ export default function App() {
           ]} active={ownerTab} onChange={id => setOwnerTab(id as OwnerTab)} />
         </>
       )}
-      {!isOwnerArea && pendingCalendarEvent ? (
+      {!isOwnerMode && pendingCalendarEvent ? (
         <CalendarConfirmation
           event={pendingCalendarEvent}
           onConfirm={confirmCalendarReminder}
@@ -734,36 +811,32 @@ function LoadingScreen() {
   )
 }
 
-function OwnerLogin({ onLogin, error }: { onLogin: (password: string) => void; error: string }) {
-  return (
-    <main className="auth-screen">
-      <section className="hello welcome-hero">
-        <div className="brand-lockup">
-          <img className="brand-mark" src="/assets/logo-mountain-mark.svg" alt="" />
-          <h1>Детки в поляне</h1>
-          <p>Вход для владельца</p>
-        </div>
-      </section>
-      {error ? <p className="error">{error}</p> : null}
-      <form className="auth-card" onSubmit={event => {
-        event.preventDefault()
-        onLogin(String(new FormData(event.currentTarget).get('password') || ''))
-      }}>
-        <div className="form-title">
-          <AppIcon name="shield" />
-          <h2>Кабинет владельца</h2>
-        </div>
-        <label>
-          Пароль
-          <input name="password" type="password" autoComplete="current-password" required />
-        </label>
-        <button type="submit">Войти</button>
-      </form>
-    </main>
-  )
-}
-
-function Welcome({ onRegister, installEvent, installApp, error }: { onRegister: (form: FormData) => void; installEvent: BeforeInstallPromptEvent | null; installApp: () => void; error: string }) {
+function UnifiedEntry({
+  mode,
+  identifier,
+  onIdentifierChange,
+  onContinue,
+  onOwnerLogin,
+  onRegister,
+  onSelectTab,
+  suggestedTab,
+  installEvent,
+  installApp,
+  error
+}: {
+  mode: EntryMode
+  identifier: string
+  onIdentifierChange: (value: string) => void
+  onContinue: () => void
+  onOwnerLogin: (password: string) => void
+  onRegister: (form: FormData) => void
+  onSelectTab: (tab: EntryTab) => void
+  suggestedTab: EntryTab | ''
+  installEvent: BeforeInstallPromptEvent | null
+  installApp: () => void
+  error: string
+}) {
+  const activeTab: EntryTab = mode === 'register' ? 'register' : 'login'
   return (
     <main className="auth-screen">
       <section className="hello welcome-hero">
@@ -774,25 +847,114 @@ function Welcome({ onRegister, installEvent, installApp, error }: { onRegister: 
           <p>Следите за расписанием, записывайтесь на занятия и отслеживайте свои абонементы</p>
         </div>
       </section>
-      {error ? <p className="error">{error}</p> : null}
-      <form className="auth-card welcome-form" onSubmit={event => { event.preventDefault(); onRegister(new FormData(event.currentTarget)) }}>
-        <h2>Давайте познакомимся</h2>
-        <fieldset className="form-section">
-          <legend>Ваш ребенок</legend>
-          <label>Имя ребенка<input name="childName" placeholder="Миша" required /></label>
-        </fieldset>
-        <fieldset className="form-section">
-          <legend>Контакт родителя</legend>
-          <label>Имя<input name="firstName" autoComplete="given-name" placeholder="Анна" required /></label>
-          <label>Фамилия<input name="lastName" autoComplete="family-name" placeholder="Иванова" required /></label>
-          <label>Телефон<input name="phone" inputMode="tel" autoComplete="tel" placeholder="+7 999 000 00 00" required /></label>
-        </fieldset>
-        <button type="submit">Продолжить</button>
-      </form>
+      {error ? (
+        <div className="entry-error">
+          <p className="error">{error}</p>
+          {suggestedTab ? (
+            <button type="button" className="secondary" onClick={() => onSelectTab(suggestedTab)}>
+              {suggestedTab === 'register' ? 'Перейти к регистрации' : 'Перейти ко входу'}
+            </button>
+          ) : null}
+        </div>
+      ) : null}
+      {mode === 'login' ? (
+        <form className="auth-card welcome-form" onSubmit={event => {
+          event.preventDefault()
+          onContinue()
+        }}>
+          <EntryTabs active={activeTab} onChange={onSelectTab} />
+          <h2>Вход в приложение</h2>
+          <label>
+            Телефон или логин
+            <input
+              name="identifier"
+              value={identifier}
+              onChange={event => onIdentifierChange(event.target.value)}
+              autoComplete="username"
+              placeholder="+7 999 000 00 00 или login"
+              required
+            />
+          </label>
+          <button type="submit">Продолжить</button>
+        </form>
+      ) : mode === 'owner' ? (
+        <form className="auth-card welcome-form" onSubmit={event => {
+          event.preventDefault()
+          onOwnerLogin(String(new FormData(event.currentTarget).get('password') || ''))
+        }}>
+          <EntryTabs active={activeTab} onChange={onSelectTab} />
+          <div className="form-title">
+            <AppIcon name="shield" />
+            <h2>Вход воспитателя</h2>
+          </div>
+          <label>
+            Логин
+            <input
+              name="login"
+              value={identifier}
+              onChange={event => onIdentifierChange(event.target.value)}
+              autoComplete="username"
+              required
+            />
+          </label>
+          <label>
+            Пароль
+            <input name="password" type="password" autoComplete="current-password" required />
+          </label>
+          <div className="entry-actions">
+            <button type="submit">Войти</button>
+            <button type="button" className="secondary" onClick={() => onSelectTab('login')}>Изменить логин</button>
+          </div>
+        </form>
+      ) : (
+        <form className="auth-card welcome-form" onSubmit={event => {
+          event.preventDefault()
+          onRegister(new FormData(event.currentTarget))
+        }}>
+          <EntryTabs active={activeTab} onChange={onSelectTab} />
+          <h2>Давайте познакомимся</h2>
+          <label>
+            Телефон
+            <input
+              name="phone"
+              value={identifier}
+              onChange={event => onIdentifierChange(event.target.value)}
+              inputMode="tel"
+              autoComplete="tel"
+              required
+            />
+          </label>
+          <fieldset className="form-section">
+            <legend>Контакт родителя</legend>
+            <label>Имя<input name="firstName" autoComplete="given-name" placeholder="Анна" required /></label>
+            <label>Фамилия<input name="lastName" autoComplete="family-name" placeholder="Иванова" required /></label>
+          </fieldset>
+          <fieldset className="form-section">
+            <legend>Ребёнок</legend>
+            <label>Имя ребёнка<input name="childName" placeholder="Миша" required /></label>
+          </fieldset>
+          <div className="entry-actions">
+            <button type="submit">Продолжить</button>
+          </div>
+        </form>
+      )}
       <section>
         {installEvent ? <button type="button" className="secondary" onClick={installApp}>Установить на телефон</button> : null}
       </section>
     </main>
+  )
+}
+
+function EntryTabs({ active, onChange }: { active: EntryTab; onChange: (tab: EntryTab) => void }) {
+  return (
+    <div className="auth-tabs" role="tablist" aria-label="Вход или регистрация">
+      <button type="button" role="tab" aria-selected={active === 'login'} className={active === 'login' ? 'active' : ''} onClick={() => onChange('login')}>
+        Вход
+      </button>
+      <button type="button" role="tab" aria-selected={active === 'register'} className={active === 'register' ? 'active' : ''} onClick={() => onChange('register')}>
+        Регистрация
+      </button>
+    </div>
   )
 }
 

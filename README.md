@@ -9,13 +9,13 @@ npm install
 npm run dev
 ```
 
-Родители: http://localhost:5173/
-
-Владелец: http://localhost:5173/owner
+Единый вход для родителей и воспитателя: http://localhost:5173/
 
 Без `DATABASE_URL` данные сохраняются локально в `server/data/state.json`.
 
-Локальный пароль владельца: `detki-owner-dev`.
+Локальный логин воспитателя: `admin`.
+
+Локальный пароль воспитателя: `detki-owner-dev`.
 
 ## Railway
 
@@ -23,8 +23,9 @@ npm run dev
 2. Создать сервис в Railway из GitHub-репозитория.
 3. Добавить PostgreSQL в проект Railway.
 4. В переменных сервиса приложения должен быть `DATABASE_URL` от PostgreSQL.
-5. Добавить обязательную переменную `OWNER_PASSWORD` с надежным паролем владельца.
-6. Build command: `npm run build`.
-7. Start command: `npm run start`.
+5. Добавить переменную `OWNER_LOGIN` с логином воспитателя.
+6. Добавить обязательную переменную `OWNER_PASSWORD` с надежным паролем воспитателя.
+7. Build command: `npm run build`.
+8. Start command: `npm run start`.
 
 На Railway данные сохраняются в PostgreSQL.

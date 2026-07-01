@@ -82,6 +82,7 @@ test('owner household is available to every parent and contains every child', as
       ...process.env,
       PORT: String(port),
       STATE_FILE: stateFile,
+      OWNER_LOGIN: 'teacher',
       OWNER_PASSWORD: 'test-owner',
       NODE_ENV: 'test'
     },
@@ -93,16 +94,42 @@ test('owner household is available to every parent and contains every child', as
   })
   await waitForServer(baseUrl)
 
+  const wrongLogin = await request(baseUrl, '/api/owner/login', {
+    method: 'POST',
+    body: JSON.stringify({ login: 'wrong', password: 'test-owner' })
+  })
+  assert.equal(wrongLogin.status, 401)
+
+  const wrongPassword = await request(baseUrl, '/api/owner/login', {
+    method: 'POST',
+    body: JSON.stringify({ login: 'teacher', password: 'wrong' })
+  })
+  assert.equal(wrongPassword.status, 401)
+
   const login = await request(baseUrl, '/api/owner/login', {
+    method: 'POST',
+    body: JSON.stringify({ login: 'teacher', password: 'test-owner' })
+  })
+  assert.equal(login.status, 200)
+
+  const legacyLogin = await request(baseUrl, '/api/owner/login', {
     method: 'POST',
     body: JSON.stringify({ password: 'test-owner' })
   })
-  assert.equal(login.status, 200)
+  assert.equal(legacyLogin.status, 200)
+
   const ownerHeaders = { 'x-owner-token': login.body.token }
   const migrated = await request(baseUrl, '/api/owner/state', { headers: ownerHeaders })
   assert.equal(migrated.body.families.find(item => item.id === 'legacy-child').householdId, 'household-legacy-child')
   assert.equal(migrated.body.parents.find(item => item.householdId === 'household-legacy-child').phone, '79991112233')
   assert.equal(migrated.body.subscriptions.find(item => item.childId === 'legacy-child').remainingLessons, 3)
+
+  const unknownFamily = await request(baseUrl, '/api/families', {
+    method: 'POST',
+    body: JSON.stringify({ phone: '+7 901 000-00-01' })
+  })
+  assert.equal(unknownFamily.status, 400)
+  assert.equal(unknownFamily.body.error, 'family_not_found')
 
   const created = await request(baseUrl, '/api/owner/households', {
     method: 'POST',
@@ -116,6 +143,21 @@ test('owner household is available to every parent and contains every child', as
   const createdChild = created.body.families.find(item => item.childName === 'Миша')
   const householdId = createdChild.householdId
   const firstChildId = createdChild.id
+
+  const duplicateRegistration = await request(baseUrl, '/api/families', {
+    method: 'POST',
+    body: JSON.stringify({
+      register: true,
+      phone: '8 900 100-20-30',
+      firstName: 'Другая',
+      lastName: 'Семья',
+      childName: 'Другой ребёнок'
+    })
+  })
+  assert.equal(duplicateRegistration.status, 400)
+  assert.equal(duplicateRegistration.body.error, 'family_already_exists')
+  const stateAfterDuplicate = await request(baseUrl, '/api/owner/state', { headers: ownerHeaders })
+  assert.equal(stateAfterDuplicate.body.families.length, 2)
 
   const addedParent = await request(baseUrl, `/api/owner/households/${householdId}/parents`, {
     method: 'POST',
@@ -134,7 +176,7 @@ test('owner household is available to every parent and contains every child', as
   const parentLogin = await request(baseUrl, '/api/families', {
     method: 'POST',
     body: JSON.stringify({
-      phone: '+7 900 555 44 33',
+      phone: '7 900 555 44 33',
       firstName: 'Иван',
       lastName: 'Иванов',
       childName: 'Не используется'
